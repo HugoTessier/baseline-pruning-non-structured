@@ -15,6 +15,8 @@ import thop
 import resnet
 from utils import ExponentialMovingAverage, RandomMixup, RandomCutmix
 from torch.utils.data.dataloader import default_collate
+from pruning_utils import mask_network, apply_pruning_and_unmask_network
+import copy
 
 
 def main():
@@ -34,6 +36,9 @@ def main():
     ema = ExponentialMovingAverage(net, decay=args.ema_decay)
     ema.to(accelerator.device)
     ema.eval()
+
+    if args.pruning_rate != 0.:
+        mask_network(net, args.pruning_rate, args.pruning_type)
 
     nowd, wd = separates_wd_and_nowd_params(net, num_parameters)
 
@@ -75,14 +80,19 @@ def main():
                 peak = 100 * score
                 peak_step = epoch
                 if args.save_model != "":
-                    torch.save(net.state_dict(), args.save_model + "_best.pt")
+                    unmasked_net = copy.deepcopy(net)
+                    apply_pruning_and_unmask_network(unmasked_net)
+                    torch.save(unmasked_net.state_dict(), args.save_model + "_best.pt")
             if 100 * score_ema > peak_ema:
                 peak_ema = 100 * score_ema
                 peak_step_ema = epoch
                 if args.save_model != "":
-                    torch.save(ema.module.state_dict(), args.save_model + "_best_ema.pt")
+                    unmasked_ema = copy.deepcopy(ema.module)
+                    apply_pruning_and_unmask_network(unmasked_ema)
+                    torch.save(unmasked_ema.state_dict(), args.save_model + "_best_ema.pt")
             accelerator.print(
-                " {:4d}h{:02d}m epoch {:4d}".format(int(remaining_time / 3600), (int(remaining_time) % 3600) // 60,
+                " {:4d}h{:02d}m epoch {:4d}".format(int(remaining_time / 3600),
+                                                    (int(remaining_time) % 3600) // 60,
                                                     epoch + 1), end='')
             epoch += 1
             if (era == 0 and step >= total_steps_for_era) or (
@@ -93,15 +103,21 @@ def main():
 
     total_time = time.time() - start_time
     accelerator.print()
-    accelerator.print("total time is {:4d}h{:02d}m".format(int(total_time / 3600), (int(total_time) % 3600) // 60))
+    accelerator.print("total time is {:4d}h{:02d}m".format(int(total_time / 3600),
+                                                           (int(total_time) % 3600) // 60))
     accelerator.print(
-        "Peak perf is {:6.2f}% at epoch {:d} ({:6.2f}% at epoch {:d})".format(peak, peak_step, peak_ema, peak_step_ema))
+        "Peak perf is {:6.2f}% at epoch {:d} ({:6.2f}% at epoch {:d})".format(peak, peak_step, peak_ema,
+                                                                              peak_step_ema))
     accelerator.print()
     accelerator.print()
 
     if args.save_model != "":
-        torch.save(net.state_dict(), args.save_model + ".pt")
-        torch.save(ema.module.state_dict(), args.save_model + "_ema.pt")
+        unmasked_net = copy.deepcopy(net)
+        apply_pruning_and_unmask_network(unmasked_net)
+        unmasked_ema = copy.deepcopy(ema.module)
+        apply_pruning_and_unmask_network(unmasked_ema)
+        torch.save(unmasked_net.state_dict(), args.save_model + ".pt")
+        torch.save(unmasked_ema.state_dict(), args.save_model + "_ema.pt")
 
 
 def train_one_epoch(accelerator, args, criterion, ema, era, last_print, net, optimizer, scheduler, start_time, step,
@@ -351,6 +367,8 @@ def parse_args():
     parser.add_argument('--load-model', type=str, default="")
     parser.add_argument('--test-only', action="store_true")
     parser.add_argument('--no-warmup', action="store_true")
+    parser.add_argument('--pruning-rate', type=float, default=0.)
+    parser.add_argument('--pruning-type', type=str, default='random', help='Either "random" or "regular"')
     args = parser.parse_args()
     args.steps = 10 * (args.steps // 10)
     if args.weight_decay < 0:
